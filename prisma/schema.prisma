@@ -1,0 +1,578 @@
+// Competitive Intelligence OS — Database Schema
+//
+// Design notes (Phase 1):
+// - Single-tenant for V1 (per project decision). No User/Workspace/Member
+//   models yet. `Product` is the natural root of every other resource, so
+//   a future `workspaceId String?` column can be added to `Product` alone
+//   without touching the shape of anything beneath it (Source, Snapshot,
+//   Change, PricingPlan/Point, FeatureObservation, ReviewSource, Review,
+//   Trend, Report, AlertWebhook, ApiKey). Nothing here assumes a single
+//   global tenant beyond the absence of that column.
+// - Evidence is embedded (sourceId/snapshotId/evidenceText/capturedAt-style
+//   fields on the record itself) rather than modeled as one generic
+//   polymorphic `Evidence` table. Prisma has no native polymorphic
+//   relations, and a generic evidence table would need application-level
+//   joins per entity type anyway. This still satisfies "every intelligence
+//   result must be traceable to source/snapshot/timestamp/extracted text"
+//   (04_DEVELOPMENT_RULES.md #7) without extra indirection. Flagging this
+//   as a deliberate interpretation, not a silent shortcut.
+// - This schema defines structure only. No intelligence logic (diffing,
+//   extraction, sentiment, trends) is implemented in Phase 1.
+// - ChangeCategory below follows the RESOLVED taxonomy — see "Taxonomy
+//   resolution (Phase 3)" note further down for the three conflicting
+//   lists this reconciles and why.
+//
+// Phase 2 additions (additive/widening only, no data existed to migrate):
+// - Snapshot.contentHash: String -> String? (failed fetches have no content)
+// - Snapshot.requestedUrl, Snapshot.contentType: new fields for evidence
+// - Change.diff: new Json? field for the structured line-level diff
+//
+// Taxonomy resolution (Phase 3): three different ChangeCategory lists
+// existed across the project's own instructions:
+//   (A) top-level Project Instructions (original, what the enum below used
+//       to contain): FEATURE, PRICING, PRODUCT_LAUNCH, INTEGRATION,
+//       DEPRECATION, BUG_FIX, SECURITY, DOCUMENTATION, CONTENT, MARKETING,
+//       POLICY, UNKNOWN
+//   (B) 02_INTELLIGENCE_ENGINE.md §5: PRICING, FEATURE, PRODUCT,
+//       POSITIONING, CONTENT, CTA, LEGAL, DOCUMENTATION, CHANGELOG,
+//       REVIEW, OTHER
+//   (C) the Phase 3 instructions' own "Examples may include" list: pricing,
+//       feature, product, documentation, changelog, integration,
+//       legal/policy, content, marketing, unknown/other
+// (C) is the most recent, most specific instruction on this exact
+// question, and reads as a deliberate reconciliation of (A) and (B) —
+// adopted here verbatim (uppercased, legal/policy merged into one
+// LEGAL_POLICY value, unknown/other mapped to the existing UNKNOWN).
+// Dropped relative to (A)/(B): DEPRECATION, BUG_FIX, SECURITY, CTA,
+// POSITIONING, REVIEW — none appear in (C)'s reconciling list, and adding
+// categories beyond what (C) enumerates isn't this schema's call to make
+// silently. Renamed PRODUCT_LAUNCH -> PRODUCT (a bare "this is a product
+// change" claim is more conservative than asserting a launch happened,
+// matching Phase 3's "do not force a category" / "do not claim more than
+// evidence supports" instructions). No data has ever been written against
+// the old enum values (confirmed — no migration history exists, see
+// below), so this is a same-day correction, not a breaking change to any
+// real deployment.
+//
+// No migration history existed before this phase (no prisma/migrations/
+// directory) — see prisma/migrations/20260101000000_init/ for the single
+// baseline migration this phase establishes, representing the schema as
+// of the end of this phase (Phase 1 + 2 + 2.1 + 3 combined; there was
+// never a real deployment at any earlier intermediate state to preserve
+// as separate migration history).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum SourceType {
+  HOMEPAGE
+  PRICING
+  PRODUCT
+  FEATURE
+  CHANGELOG
+  DOCUMENTATION
+  BLOG
+  COMPARISON
+  REVIEW
+  CUSTOM
+}
+
+// See "Taxonomy resolution (Phase 3)" note at the top of this file.
+enum ChangeCategory {
+  FEATURE
+  PRICING
+  PRODUCT
+  DOCUMENTATION
+  CHANGELOG
+  INTEGRATION
+  LEGAL_POLICY
+  CONTENT
+  MARKETING
+  UNKNOWN
+}
+
+enum Severity {
+  INFO
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum FeatureLifecycle {
+  ACTIVE
+  REMOVED
+  UNCERTAIN
+}
+
+enum SentimentLabel {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+  MIXED
+}
+
+enum ReportFormat {
+  MARKDOWN
+  HTML
+  JSON
+}
+
+enum AlertDeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Core competitor graph
+// ---------------------------------------------------------------------------
+
+model Product {
+  id          String   @id @default(cuid())
+  name        String
+  homepageUrl String
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  sources             Source[]
+  changes             Change[]
+  pricingPlans        PricingPlan[]
+  pricingPoints       PricingPoint[]
+  featureObservations FeatureObservation[]
+  reviewSources       ReviewSource[]
+  reviews             Review[]
+  reportLinks         ReportProduct[]
+  trendLinks          TrendProduct[]
+
+  @@index([createdAt])
+}
+
+model Source {
+  id            String     @id @default(cuid())
+  productId     String
+  product       Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+  type          SourceType
+  url           String
+  label         String?
+  enabled       Boolean    @default(true)
+  lastScrapedAt DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  snapshots Snapshot[]
+  changes   Change[]
+
+  @@index([productId])
+  @@index([type])
+}
+
+model Snapshot {
+  id             String   @id @default(cuid())
+  sourceId       String
+  source         Source   @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  fetchedAt      DateTime @default(now())
+  // The URL actually requested for this snapshot. Source.url is mutable, so
+  // this is preserved per-snapshot for an accurate evidence trail even if
+  // the source's configured URL changes later. (Phase 2 addition.)
+  requestedUrl   String   @default("")
+  finalUrl       String?
+  statusCode     Int?
+  // Nullable (Phase 2 change, was required): a fetch that fails outright
+  // (SSRF-blocked, timeout, connection refused) has no content to hash at
+  // all. `error` below already anticipated failed-attempt rows; contentHash
+  // now matches that by being optional.
+  contentHash    String?
+  // Response Content-Type header, captured for evidence/debugging when a
+  // fetch is rejected or succeeds. (Phase 2 addition.)
+  contentType    String?
+  // Phase 2.1 addition: these three participate in contentHash (see
+  // contentHash.ts's buildCanonicalRepresentation) but were never actually
+  // persisted — meaning there was no way to reconstruct a previous
+  // snapshot's full NormalizedContent to structurally diff against, only
+  // its normalizedText/headings/links/structuredData. Without this, the
+  // Phase 2.1 hash/diff consistency fix (structuralDiff.ts) would have
+  // nothing to compare title/description/canonicalUrl against for any
+  // snapshot pulled back out of the database.
+  title          String?
+  metaDescription String?
+  canonicalUrl   String?
+  normalizedText String?
+  headings       Json?
+  links          Json?
+  // Phase 5 addition: raw <li> text (deduped/capped like headings/links).
+  // Feeds feature extraction; also participates in contentHash (see
+  // contentHash.ts) so a feature-list-only change isn't invisible to the
+  // contentChanged gate that pricing/feature extraction run on.
+  listItems      Json?
+  structuredData Json?
+  renderRequired Boolean  @default(false)
+  error          String?
+  durationMs     Int?
+  createdAt      DateTime @default(now())
+
+  changesFrom Change[] @relation("ChangeFromSnapshot")
+  changesTo   Change[] @relation("ChangeToSnapshot")
+
+  @@index([sourceId, fetchedAt])
+  @@index([contentHash])
+}
+
+model Change {
+  id             String         @id @default(cuid())
+  productId      String
+  product        Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sourceId       String
+  source         Source         @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  fromSnapshotId String?
+  fromSnapshot   Snapshot?      @relation("ChangeFromSnapshot", fields: [fromSnapshotId], references: [id])
+  toSnapshotId   String
+  toSnapshot     Snapshot       @relation("ChangeToSnapshot", fields: [toSnapshotId], references: [id])
+  category       ChangeCategory
+  severity       Severity       @default(LOW)
+  confidence     Float?
+  summary        String
+  detail         String?
+  // Structured deterministic diff — see src/lib/diff/structuralDiff.ts for
+  // the shape ({ fields: FieldChange[], text: LineDiff, ... }) plus
+  // classification evidence (Phase 3: { matchedRule, evidence[] }).
+  // `summary` stays the free-text human-readable form.
+  diff           Json?
+  evidenceText   String?
+  detectedAt     DateTime       @default(now())
+  createdAt      DateTime       @default(now())
+
+  // Phase 3: idempotency. The transition between exactly these two
+  // snapshots can only ever be recorded once — re-processing the same
+  // snapshot pair (e.g. a retried scrape request) must not create a
+  // duplicate Change. A Change is only ever created when a previous
+  // snapshot exists (see scrapeSource.ts), so fromSnapshotId is never
+  // null on an actual Change row in practice.
+  @@unique([fromSnapshotId, toSnapshotId])
+  @@index([productId, detectedAt])
+  @@index([sourceId, detectedAt])
+  @@index([category])
+}
+
+// ---------------------------------------------------------------------------
+// Pricing intelligence
+// ---------------------------------------------------------------------------
+
+model PricingPlan {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name      String
+  // Phase 4 addition: the plan-identity matching key (normalizePlanName
+  // output — lowercased, punctuation-stripped, generic suffix words like
+  // "plan"/"tier" removed). `name` keeps the nicer first-seen display
+  // form; this is what "Pro" / "PRO" / "Pro Plan" all resolve to so they
+  // become one plan, not three (Phase 4.2).
+  normalizedName String
+  active    Boolean  @default(true)
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  pricingPoints PricingPoint[]
+
+  @@unique([productId, normalizedName])
+  @@index([productId])
+}
+
+model PricingPoint {
+  id             String       @id @default(cuid())
+  productId      String
+  product        Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  pricingPlanId  String
+  pricingPlan    PricingPlan  @relation(fields: [pricingPlanId], references: [id], onDelete: Cascade)
+  price          Float?
+  currency       String?
+  billingPeriod  String?
+  unit           String?
+  isCustomPricing Boolean     @default(false)
+  limits         Json?
+  features       Json?
+  // Phase 4 addition: deterministic identity of "which price of this
+  // plan" — billingPeriod|unit|kind (see extractPricing.ts's
+  // pricingObservationKey). A plan can legitimately have both a monthly
+  // and a yearly price; this is what keeps them as separate, correctly
+  // comparable series instead of colliding. Also the idempotency key
+  // together with (pricingPlanId, snapshotId) below.
+  observationKey String      @default("")
+  sourceId       String?
+  snapshotId     String?
+  evidenceText   String?
+  extractionMethod String?
+  capturedAt     DateTime     @default(now())
+  createdAt      DateTime     @default(now())
+
+  // Idempotency (Phase 4.7): reprocessing the same snapshot for the same
+  // plan+observation-kind must not create a duplicate row.
+  @@unique([pricingPlanId, snapshotId, observationKey])
+  @@index([productId, capturedAt])
+  @@index([pricingPlanId, capturedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Feature intelligence
+// ---------------------------------------------------------------------------
+
+// Feature.canonicalName is intentionally GLOBAL, not per-product — this was
+// the Phase 1 design (reused as-is per the Phase 4/5 instructions: "Do not
+// recreate these models"). It matches 03_ARCHITECTURE.md's description of
+// Feature as a cross-competitor canonical identity (the same "SSO" Feature
+// row is shared by every product that has it), which is what makes
+// adoption-style questions ("how many competitors have X") answerable —
+// FeatureObservation is the per-product join.
+model Feature {
+  id            String   @id @default(cuid())
+  canonicalName String   @unique
+  aliases       String[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  observations FeatureObservation[]
+}
+
+model FeatureObservation {
+  id            String           @id @default(cuid())
+  featureId     String
+  feature       Feature          @relation(fields: [featureId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  status        FeatureLifecycle @default(ACTIVE)
+  confidence    Float?
+  firstSeenAt   DateTime         @default(now())
+  lastSeenAt    DateTime         @default(now())
+  sourceId      String?
+  snapshotId    String?
+  evidenceText  String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  // Phase 5 addition: this row is a CURRENT-STATE record per (feature,
+  // product) — updated in place (lastSeenAt refreshed, status
+  // transitioned) rather than inserted anew on every scan (Phase 5.4/5.5:
+  // "repeated observation -> update lastSeenAt rather than creating
+  // uncontrolled duplicates"). This constraint is what the upsert in
+  // persistFeatures.ts keys on.
+  @@unique([featureId, productId])
+  @@index([productId, status])
+  @@index([featureId])
+}
+
+// ---------------------------------------------------------------------------
+// Review intelligence
+// ---------------------------------------------------------------------------
+
+model ReviewSource {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  platform  String
+  url       String?
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reviews Review[]
+
+  @@index([productId])
+}
+
+model Review {
+  id                  String    @id @default(cuid())
+  reviewSourceId      String
+  reviewSource        ReviewSource @relation(fields: [reviewSourceId], references: [id], onDelete: Cascade)
+  productId           String
+  product             Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  externalId          String?
+  author              String?
+  rating              Float?
+  title               String?
+  body                String
+  sourceUrl           String?
+  publishedAt         DateTime?
+  collectedAt         DateTime  @default(now())
+  sentimentScore      Float?
+  sentimentLabel      SentimentLabel?
+  sentimentConfidence Float?
+  // Phase 6: content fingerprint (see src/lib/reviews/dedupe.ts). Populated
+  // ONLY when the review has neither an externalId nor a usable per-review
+  // permalink — it's the dedup key of last resort. The unique constraint
+  // below applies to non-null values only (Postgres treats NULLs as
+  // distinct), which is exactly the intent: reviews deduped by externalId
+  // keep fingerprint NULL and are unaffected.
+  //
+  // NOTE the existing @@unique([reviewSourceId, externalId]) does NOT
+  // prevent duplicates when externalId is NULL for the same reason —
+  // application-level dedup (dedupe.ts + services/ingestReviews.ts) is
+  // what actually covers that case; the DB constraints are a backstop.
+  fingerprint         String?
+  createdAt           DateTime  @default(now())
+
+  topicObservations ReviewTopicObservation[]
+
+  @@unique([reviewSourceId, externalId])
+  @@unique([reviewSourceId, fingerprint])
+  @@index([productId, publishedAt])
+  @@index([productId, sentimentLabel])
+}
+
+model ReviewTopic {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  label     String
+  createdAt DateTime @default(now())
+
+  observations ReviewTopicObservation[]
+}
+
+model ReviewTopicObservation {
+  id            String      @id @default(cuid())
+  reviewId      String
+  review        Review      @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  reviewTopicId String
+  reviewTopic   ReviewTopic @relation(fields: [reviewTopicId], references: [id], onDelete: Cascade)
+  sentiment     Float?
+  frequency     Int         @default(1)
+  // Phase 6: the dictionary terms that actually matched (evidence — a
+  // topic observation is never just a bare label).
+  matchedTerms  String[]
+  createdAt     DateTime    @default(now())
+
+  // Phase 6: one observation per (review, topic) — reprocessing a review
+  // updates it in place instead of duplicating.
+  @@unique([reviewId, reviewTopicId])
+  @@index([reviewTopicId])
+  @@index([reviewId])
+}
+
+// ---------------------------------------------------------------------------
+// Cross-competitor trends
+// ---------------------------------------------------------------------------
+
+model Trend {
+  id              String   @id @default(cuid())
+  category        String
+  term            String?
+  periodStart     DateTime
+  periodEnd       DateTime
+  frequency       Int      @default(0)
+  growth          Float?
+  acceleration    Float?
+  competitorCount Int      @default(0)
+  confidence      Float?
+  evidence        Json?
+  createdAt       DateTime @default(now())
+
+  products TrendProduct[]
+
+  @@index([category, periodStart])
+}
+
+model TrendProduct {
+  trendId   String
+  trend     Trend   @relation(fields: [trendId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([trendId, productId])
+}
+
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+
+model Report {
+  id          String       @id @default(cuid())
+  title       String
+  format      ReportFormat @default(MARKDOWN)
+  periodStart DateTime
+  periodEnd   DateTime
+  content     String
+  aiEnhanced  Boolean      @default(false)
+  aiProvider  String?
+  aiModel     String?
+  createdAt   DateTime     @default(now())
+
+  products ReportProduct[]
+
+  @@index([createdAt])
+}
+
+model ReportProduct {
+  reportId  String
+  report    Report  @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([reportId, productId])
+}
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+
+model AlertWebhook {
+  id         String   @id @default(cuid())
+  name       String
+  url        String
+  secret     String?
+  eventTypes String[]
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  deliveries AlertDelivery[]
+}
+
+model AlertDelivery {
+  id              String              @id @default(cuid())
+  alertWebhookId  String
+  alertWebhook    AlertWebhook        @relation(fields: [alertWebhookId], references: [id], onDelete: Cascade)
+  eventType       String
+  entityType      String
+  entityId        String
+  payload         Json
+  status          AlertDeliveryStatus @default(PENDING)
+  attempts        Int                 @default(0)
+  responseStatus  Int?
+  error           String?
+  lastAttemptAt   DateTime?
+  createdAt       DateTime            @default(now())
+
+  @@index([alertWebhookId, status])
+  @@index([entityType, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Public API auth
+// ---------------------------------------------------------------------------
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  name       String
+  keyPrefix  String
+  hashedKey  String    @unique
+  scopes     String[]
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([keyPrefix])
+}
